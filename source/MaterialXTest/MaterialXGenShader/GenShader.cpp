@@ -251,6 +251,237 @@ TEST_CASE("GenShader: Shader Translation", "[translate]")
     }
 }
 
+TEST_CASE("GenShader: Shader Translation Connections", "[translate]")
+{
+    mx::FileSearchPath searchPath = mx::getDefaultDataSearchPath();
+
+    auto createTranslationDoc = [&searchPath](const mx::string& documentString)
+    {
+        mx::DocumentPtr libraries = mx::createDocument();
+        mx::loadLibraries({ "libraries" }, searchPath, libraries);
+        mx::DocumentPtr doc = mx::createDocument();
+        mx::readFromXmlString(doc, documentString);
+        doc->setDataLibrary(libraries);
+        return doc;
+    };
+
+    // Upstream connections originating in multiple node graphs must each be
+    // routed to the matching translation node input.
+    {
+        const mx::string documentString =
+            R"(<?xml version="1.0"?>
+            <materialx version="1.39">
+              <nodegraph name="NG_Color">
+                <constant name="color_const" type="color3">
+                  <input name="value" type="color3" value="0.6,0.1,0.2"/>
+                </constant>
+                <output name="color_out" type="color3" nodename="color_const"/>
+              </nodegraph>
+              <nodegraph name="NG_Rough">
+                <constant name="rough_const" type="float">
+                  <input name="value" type="float" value="0.42"/>
+                </constant>
+                <output name="rough_out" type="float" nodename="rough_const"/>
+              </nodegraph>
+              <standard_surface name="shader_multi_graph" type="surfaceshader">
+                <input name="base_color" type="color3" nodegraph="NG_Color" output="color_out"/>
+                <input name="specular_roughness" type="float" nodegraph="NG_Rough" output="rough_out"/>
+              </standard_surface>
+              <surfacematerial name="material_multi_graph" type="material">
+                <input name="surfaceshader" type="surfaceshader" nodename="shader_multi_graph"/>
+              </surfacematerial>
+            </materialx>)";
+
+        mx::DocumentPtr doc = createTranslationDoc(documentString);
+        mx::ShaderTranslator::create()->translateAllMaterials(doc, "UsdPreviewSurface");
+
+        std::string errors;
+        REQUIRE(doc->validate(&errors));
+        REQUIRE(doc->getNodeGraph("NG_Color") != nullptr);
+        REQUIRE(doc->getNodeGraph("NG_Rough") != nullptr);
+        mx::NodeGraphPtr translationGraph = doc->getNodeGraph("shader_multi_graph_translation_graph");
+        REQUIRE(translationGraph != nullptr);
+        mx::NodePtr translationNode = translationGraph->getNode("standard_surface_to_UsdPreviewSurface");
+        REQUIRE(translationNode != nullptr);
+        REQUIRE(translationNode->getInput("base_color")->getConnectedOutput()->getParent()->getName() == "NG_Color");
+        REQUIRE(translationNode->getInput("specular_roughness")->getConnectedOutput()->getParent()->getName() == "NG_Rough");
+    }
+
+    // Upstream nodes at the document's top level must remain referenced, via
+    // document-level outputs, rather than being dropped.
+    {
+        const mx::string documentString =
+            R"(<?xml version="1.0"?>
+            <materialx version="1.39">
+              <constant name="top_color" type="color3">
+                <input name="value" type="color3" value="0.5,0.1,0.2"/>
+              </constant>
+              <standard_surface name="shader_top_level" type="surfaceshader">
+                <input name="base_color" type="color3" nodename="top_color"/>
+              </standard_surface>
+              <surfacematerial name="material_top_level" type="material">
+                <input name="surfaceshader" type="surfaceshader" nodename="shader_top_level"/>
+              </surfacematerial>
+            </materialx>)";
+
+        mx::DocumentPtr doc = createTranslationDoc(documentString);
+        REQUIRE_NOTHROW(mx::ShaderTranslator::create()->translateAllMaterials(doc, "UsdPreviewSurface"));
+
+        std::string errors;
+        REQUIRE(doc->validate(&errors));
+        REQUIRE(doc->getNode("top_color") != nullptr);
+        mx::OutputPtr documentOutput = doc->getOutput("top_color_translation_output");
+        REQUIRE(documentOutput != nullptr);
+        REQUIRE(documentOutput->getConnectedNode()->getName() == "top_color");
+    }
+
+    // A specific output of a multi-output upstream node must be preserved
+    // when the node and shader share a graph.
+    {
+        const mx::string documentString =
+            R"(<?xml version="1.0"?>
+            <materialx version="1.39">
+              <nodegraph name="NG_Multi">
+                <constant name="multi_const" type="color3">
+                  <input name="value" type="color3" value="0.7,0.2,0.1"/>
+                </constant>
+                <separate3 name="separate_node" type="multioutput" nodedef="ND_separate3_color3">
+                  <input name="in" type="color3" nodename="multi_const"/>
+                </separate3>
+                <standard_surface name="shader_multi_output" type="surfaceshader">
+                  <input name="base" type="float" nodename="separate_node" output="outr"/>
+                </standard_surface>
+                <output name="surfaceshader_out" type="surfaceshader" nodename="shader_multi_output"/>
+              </nodegraph>
+              <surfacematerial name="material_multi_output" type="material">
+                <input name="surfaceshader" type="surfaceshader" nodegraph="NG_Multi" output="surfaceshader_out"/>
+              </surfacematerial>
+            </materialx>)";
+
+        mx::DocumentPtr doc = createTranslationDoc(documentString);
+        REQUIRE_NOTHROW(mx::ShaderTranslator::create()->translateAllMaterials(doc, "UsdPreviewSurface"));
+
+        std::string errors;
+        REQUIRE(doc->validate(&errors));
+        mx::NodeGraphPtr graph = doc->getNodeGraph("NG_Multi");
+        REQUIRE(graph != nullptr);
+        mx::NodePtr translationNode = graph->getNode("standard_surface_to_UsdPreviewSurface");
+        REQUIRE(translationNode != nullptr);
+        mx::InputPtr baseInput = translationNode->getInput("base");
+        REQUIRE(baseInput != nullptr);
+        REQUIRE(baseInput->getConnectedNode()->getName() == "separate_node");
+        REQUIRE(baseInput->getOutputString() == "outr");
+    }
+
+    // A world-space normalmap must not be routed through the translation
+    // math; it must be recreated outside the translation node while the
+    // tangent-space image stream feeds both.
+    {
+        const mx::string documentString =
+            R"(<?xml version="1.0"?>
+            <materialx version="1.39">
+              <nodegraph name="NG_Normal">
+                <tiledimage name="normal_image" type="vector3">
+                  <input name="file" type="filename" value="normal.jpg"/>
+                </tiledimage>
+                <normalmap name="original_normalmap" type="vector3">
+                  <input name="in" type="vector3" nodename="normal_image"/>
+                  <input name="scale" type="float" value="2.0"/>
+                </normalmap>
+                <output name="normal_world_out" type="vector3" nodename="original_normalmap"/>
+              </nodegraph>
+              <standard_surface name="shader_normal" type="surfaceshader">
+                <input name="normal" type="vector3" nodegraph="NG_Normal" output="normal_world_out"/>
+              </standard_surface>
+              <surfacematerial name="material_normal" type="material">
+                <input name="surfaceshader" type="surfaceshader" nodename="shader_normal"/>
+              </surfacematerial>
+            </materialx>)";
+
+        mx::DocumentPtr doc = createTranslationDoc(documentString);
+        REQUIRE_NOTHROW(mx::ShaderTranslator::create()->translateAllMaterials(doc, "UsdPreviewSurface"));
+
+        std::string errors;
+        REQUIRE(doc->validate(&errors));
+        mx::NodeGraphPtr graph = doc->getNodeGraph("NG_Normal");
+        REQUIRE(graph != nullptr);
+        mx::NodePtr translationNode = graph->getNode("standard_surface_to_UsdPreviewSurface");
+        REQUIRE(translationNode != nullptr);
+        REQUIRE(translationNode->getInput("normal")->getConnectedNode()->getName() == "normal_image");
+
+        bool foundRecreatedNormalmap = false;
+        for (mx::NodePtr node : graph->getNodes())
+        {
+            if (node->getCategory() == "normalmap" && node->getName() != "original_normalmap")
+            {
+                foundRecreatedNormalmap = true;
+                REQUIRE(node->getInput("scale")->getValueString() == "2.0");
+            }
+        }
+        REQUIRE(foundRecreatedNormalmap);
+    }
+
+    // A failed translation must leave the document in its original, usable
+    // state rather than half-modified.
+    {
+        const mx::string documentString =
+            R"(<?xml version="1.0"?>
+            <materialx version="1.39">
+              <constant name="rollback_color" type="color3">
+                <input name="value" type="color3" value="0.2,0.3,0.4"/>
+              </constant>
+              <standard_surface name="shader_rollback" type="surfaceshader">
+                <input name="base_color" type="color3" nodename="rollback_color"/>
+              </standard_surface>
+              <surfacematerial name="material_rollback" type="material">
+                <input name="surfaceshader" type="surfaceshader" nodename="shader_rollback"/>
+              </surfacematerial>
+            </materialx>)";
+
+        mx::DocumentPtr doc = createTranslationDoc(documentString);
+        const mx::string originalXml = mx::writeToXmlString(doc);
+
+        REQUIRE_THROWS(mx::ShaderTranslator::create()->translateShader(
+            doc->getNode("shader_rollback"), "nonexistent_shader_model"));
+
+        REQUIRE(mx::writeToXmlString(doc) == originalXml);
+        std::string errors;
+        REQUIRE(doc->validate(&errors));
+        REQUIRE(doc->getNode("shader_rollback")->getCategory() == "standard_surface");
+    }
+
+    // When translateAllMaterials fails after some shaders have translated,
+    // the full document must be restored to its pre-call state.
+    {
+        const mx::string documentString =
+            R"(<?xml version="1.0"?>
+            <materialx version="1.39">
+              <standard_surface name="good_shader" type="surfaceshader">
+                <input name="base" type="float" value="0.5"/>
+              </standard_surface>
+              <surfacematerial name="good_material" type="material">
+                <input name="surfaceshader" type="surfaceshader" nodename="good_shader"/>
+              </surfacematerial>
+              <open_pbr_surface name="pbr_shader" type="surfaceshader">
+                <input name="base_weight" type="float" value="0.9"/>
+              </open_pbr_surface>
+              <surfacematerial name="pbr_material" type="material">
+                <input name="surfaceshader" type="surfaceshader" nodename="pbr_shader"/>
+              </surfacematerial>
+            </materialx>)";
+
+        mx::DocumentPtr doc = createTranslationDoc(documentString);
+        const mx::string originalXml = mx::writeToXmlString(doc);
+
+        REQUIRE_THROWS(mx::ShaderTranslator::create()->translateAllMaterials(doc, "UsdPreviewSurface"));
+
+        REQUIRE(mx::writeToXmlString(doc) == originalXml);
+        std::string errors;
+        REQUIRE(doc->validate(&errors));
+        REQUIRE(doc->getNode("good_shader")->getCategory() == "standard_surface");
+    }
+}
+
 TEST_CASE("GenShader: Transparency Regression Check", "[genshader]")
 {
     mx::FileSearchPath searchPath = mx::getDefaultDataSearchPath();
