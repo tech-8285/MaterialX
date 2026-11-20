@@ -4,6 +4,7 @@
 //
 
 #include <MaterialXGenShader/Nodes/CompoundNode.h>
+#include <MaterialXGenShader/ColorManagementSystem.h>
 #include <MaterialXGenShader/Exception.h>
 #include <MaterialXGenShader/ShaderGenerator.h>
 #include <MaterialXGenShader/Util.h>
@@ -19,6 +20,64 @@ MATERIALX_NAMESPACE_BEGIN
 ShaderNodeImplPtr CompoundNode::create()
 {
     return std::make_shared<CompoundNode>();
+}
+
+string CompoundNode::getColorSpaceSignature(const NodeDef& nodeDef, GenContext& context)
+{
+    // The signature is computed from the node instance currently being created,
+    // which is the innermost node on the context's parent node stack.
+    const vector<ConstNodePtr>& parentNodes = context.getParentNodes();
+    if (parentNodes.empty())
+    {
+        return EMPTY_STRING;
+    }
+    ConstNodePtr node = parentNodes.back();
+    if (!node || node->getNodeDef().get() != &nodeDef)
+    {
+        return EMPTY_STRING;
+    }
+    if (!node->isColorType() && !node->isMultiOutputType())
+    {
+        return EMPTY_STRING;
+    }
+
+    // Determine the target color space, matching the logic in ShaderGraph.
+    const string& targetColorSpace = context.getOptions().targetColorSpaceOverride.empty() ?
+                                     node->getDocument()->getActiveColorSpace() :
+                                     context.getOptions().targetColorSpaceOverride;
+    if (targetColorSpace.empty())
+    {
+        return EMPTY_STRING;
+    }
+
+    ColorManagementSystemPtr colorManagementSystem = context.getShaderGenerator().getColorManagementSystem();
+
+    // Collect the filename inputs that require a color space transform.
+    string signature;
+    for (InputPtr input : node->getInputs())
+    {
+        if (input->getType() != FILENAME_TYPE_STRING || (!input->hasValue() && !input->hasInterfaceName()))
+        {
+            continue;
+        }
+        const string sourceColorSpace = getFileNameColorSpace(input, parentNodes);
+        if (sourceColorSpace.empty())
+        {
+            continue;
+        }
+        // Match the no-op detection in ShaderGraph::populateColorTransformMap.
+        const bool isNoOpTransform = colorManagementSystem ?
+                                     colorManagementSystem->isNoOpTransform(sourceColorSpace, targetColorSpace) :
+                                     sourceColorSpace == targetColorSpace ||
+                                     ColorManagementSystem::isReservedNoOpColorSpace(sourceColorSpace) ||
+                                     ColorManagementSystem::isReservedNoOpColorSpace(targetColorSpace);
+        if (isNoOpTransform)
+        {
+            continue;
+        }
+        signature += "_" + input->getName() + "_" + sourceColorSpace;
+    }
+    return signature;
 }
 
 void CompoundNode::addClassification(ShaderNode& node) const
@@ -42,6 +101,16 @@ void CompoundNode::initialize(const InterfaceElement& element, GenContext& conte
     const NodeGraph& graph = static_cast<const NodeGraph&>(element);
 
     _functionName = graph.getName();
+
+    // Instances with different color space declarations on their filename inputs
+    // get dedicated implementations of this graph, with color space transforms
+    // applied per texture inside the graph, so give each variant a unique
+    // function name.
+    ConstNodeDefPtr nodeDef = graph.getNodeDef();
+    if (nodeDef)
+    {
+        _functionName += getColorSpaceSignature(*nodeDef, context);
+    }
     context.getShaderGenerator().getSyntax().makeValidName(_functionName);
 
     // For compounds we do not want to publish all internal inputs

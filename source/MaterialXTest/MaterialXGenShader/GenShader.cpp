@@ -39,6 +39,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <map>
 #include <vector>
 #include <set>
 
@@ -80,22 +81,20 @@ TEST_CASE("GenShader: Valid Libraries", "[genshader]")
     REQUIRE(valid);
 }
 
-#ifdef MATERIALX_BUILD_GEN_GLSL
-TEST_CASE("GenShader: Duplicate Output Color Transforms", "[genshader]")
+#if defined(MATERIALX_BUILD_GEN_GLSL) || defined(MATERIALX_BUILD_GEN_OSL)
+TEST_CASE("GenShader: Compound Node Color Transforms", "[genshader]")
 {
     mx::FileSearchPath searchPath = mx::getDefaultDataSearchPath();
     mx::DocumentPtr libraries = mx::createDocument();
     mx::loadLibraries({ "libraries" }, searchPath, libraries);
 
-    mx::ShaderGeneratorPtr shaderGenerator = mx::GlslShaderGenerator::create();
-    mx::ColorManagementSystemPtr colorManagementSystem =
-        mx::DefaultColorManagementSystem::create(shaderGenerator->getTarget());
-    colorManagementSystem->loadLibrary(libraries);
-    shaderGenerator->setColorManagementSystem(colorManagementSystem);
-
-    mx::GenContext context(shaderGenerator);
-    context.registerSourceCodeSearchPath(searchPath);
-    context.getOptions().targetColorSpaceOverride = "lin_rec709";
+    std::vector<mx::ShaderGeneratorPtr> shaderGenerators;
+#ifdef MATERIALX_BUILD_GEN_GLSL
+    shaderGenerators.push_back(mx::GlslShaderGenerator::create());
+#endif
+#ifdef MATERIALX_BUILD_GEN_OSL
+    shaderGenerators.push_back(mx::OslShaderGenerator::create());
+#endif
 
     const std::string docString = R"(<?xml version="1.0"?>
       <materialx version="1.39" colorspace="lin_rec709">
@@ -108,34 +107,177 @@ TEST_CASE("GenShader: Duplicate Output Color Transforms", "[genshader]")
           <input name="emission_color" type="color3" nodename="triplanar" />
         </surface_unlit>
       </materialx>)";
-    mx::DocumentPtr doc = mx::createDocument();
-    mx::readFromXmlString(doc, docString);
-    doc->setDataLibrary(libraries);
 
-    SECTION("Identical input color spaces")
+    // Run each scenario for every shader generator, checking that identical
+    // and differing input color spaces are all transformed per texture.
+    for (size_t scenario = 0; scenario < 2; ++scenario)
     {
-        // All three filename inputs request the same output transform.
-    }
-    SECTION("Different input color spaces")
-    {
-        doc->getNode("triplanar")->getInput("filey")->setColorSpace("acescg");
-        doc->getNode("triplanar")->getInput("filez")->setColorSpace("acescg");
-    }
-
-    REQUIRE(doc->validate());
-    mx::ShaderPtr shader;
-    REQUIRE_NOTHROW(shader = shaderGenerator->generate("surface", doc->getNode("surface"), context));
-    REQUIRE(shader);
-    size_t transformCount = 0;
-    for (const mx::ShaderNode* node : shader->getGraph().getNodes())
-    {
-        if (mx::stringEndsWith(node->getName(), "_cm"))
+        for (mx::ShaderGeneratorPtr shaderGenerator : shaderGenerators)
         {
-            ++transformCount;
-            CHECK(node->getImplementation().getName() == "NG_srgb_texture_to_lin_rec709_color3");
+            mx::ColorManagementSystemPtr colorManagementSystem =
+                mx::DefaultColorManagementSystem::create(shaderGenerator->getTarget());
+            colorManagementSystem->loadLibrary(libraries);
+            shaderGenerator->setColorManagementSystem(colorManagementSystem);
+
+            mx::GenContext context(shaderGenerator);
+            context.registerSourceCodeSearchPath(searchPath);
+            context.getOptions().targetColorSpaceOverride = "lin_rec709";
+
+            mx::DocumentPtr doc = mx::createDocument();
+            mx::readFromXmlString(doc, docString);
+            doc->setDataLibrary(libraries);
+
+            // Expected color transform nodes inside the compound node graph,
+            // keyed by transform implementation name.
+            std::map<std::string, size_t> expectedTransforms;
+            if (scenario == 0)
+            {
+                // Identical input color spaces.
+                expectedTransforms["NG_srgb_texture_to_lin_rec709_color3"] = 3;
+            }
+            else
+            {
+                // Different input color spaces.
+                doc->getNode("triplanar")->getInput("filey")->setColorSpace("acescg");
+                doc->getNode("triplanar")->getInput("filez")->setColorSpace("acescg");
+                expectedTransforms["NG_srgb_texture_to_lin_rec709_color3"] = 1;
+                expectedTransforms["NG_acescg_to_lin_rec709_color3"] = 2;
+            }
+
+            REQUIRE(doc->validate());
+            mx::ShaderPtr shader;
+            REQUIRE_NOTHROW(shader = shaderGenerator->generate("surface", doc->getNode("surface"), context));
+            REQUIRE(shader);
+
+            // No color transforms may remain on the compound node outputs.
+            for (const mx::ShaderNode* node : shader->getGraph().getNodes())
+            {
+                CHECK(!mx::stringEndsWith(node->getName(), "_cm"));
+            }
+
+            // Each texture is transformed inside the compound node graph instead.
+            const mx::ShaderNode* triplanarNode = shader->getGraph().getNode("triplanar");
+            REQUIRE(triplanarNode);
+            const mx::ShaderGraph* compoundGraph = triplanarNode->getImplementation().getGraph();
+            REQUIRE(compoundGraph);
+            std::map<std::string, size_t> transformCounts;
+            for (const mx::ShaderNode* node : compoundGraph->getNodes())
+            {
+                if (mx::stringEndsWith(node->getName(), "_cm"))
+                {
+                    transformCounts[node->getImplementation().getName()]++;
+                }
+            }
+            CHECK(transformCounts == expectedTransforms);
         }
     }
-    CHECK(transformCount == 1);
+}
+#endif
+
+#if defined(MATERIALX_BUILD_GEN_GLSL) || defined(MATERIALX_BUILD_GEN_OSL)
+TEST_CASE("GenShader: Compound Node Color Transform Variants", "[genshader]")
+{
+    mx::FileSearchPath searchPath = mx::getDefaultDataSearchPath();
+    mx::DocumentPtr libraries = mx::createDocument();
+    mx::loadLibraries({ "libraries" }, searchPath, libraries);
+
+    std::vector<mx::ShaderGeneratorPtr> shaderGenerators;
+#ifdef MATERIALX_BUILD_GEN_GLSL
+    shaderGenerators.push_back(mx::GlslShaderGenerator::create());
+#endif
+#ifdef MATERIALX_BUILD_GEN_OSL
+    shaderGenerators.push_back(mx::OslShaderGenerator::create());
+#endif
+
+    // Two instances of the same compound node declare different color spaces,
+    // and a plain image node declares one of its own.
+    const std::string docString = R"(<?xml version="1.0"?>
+      <materialx version="1.39" colorspace="lin_rec709">
+        <triplanarprojection name="triplanar_a" type="color3">
+          <input name="filex" type="filename" value="" colorspace="srgb_texture" />
+          <input name="filey" type="filename" value="" colorspace="srgb_texture" />
+          <input name="filez" type="filename" value="" colorspace="srgb_texture" />
+        </triplanarprojection>
+        <triplanarprojection name="triplanar_b" type="color3">
+          <input name="filex" type="filename" value="" colorspace="acescg" />
+          <input name="filey" type="filename" value="" colorspace="acescg" />
+          <input name="filez" type="filename" value="" colorspace="acescg" />
+        </triplanarprojection>
+        <image name="img" type="color3">
+          <input name="file" type="filename" value="" colorspace="srgb_texture" />
+        </image>
+        <add name="sum" type="color3">
+          <input name="in1" type="color3" nodename="triplanar_a" />
+          <input name="in2" type="color3" nodename="triplanar_b" />
+        </add>
+        <add name="sum2" type="color3">
+          <input name="in1" type="color3" nodename="sum" />
+          <input name="in2" type="color3" nodename="img" />
+        </add>
+        <surface_unlit name="surface" type="surfaceshader">
+          <input name="emission_color" type="color3" nodename="sum2" />
+        </surface_unlit>
+      </materialx>)";
+
+    for (mx::ShaderGeneratorPtr shaderGenerator : shaderGenerators)
+    {
+        mx::ColorManagementSystemPtr colorManagementSystem =
+            mx::DefaultColorManagementSystem::create(shaderGenerator->getTarget());
+        colorManagementSystem->loadLibrary(libraries);
+        shaderGenerator->setColorManagementSystem(colorManagementSystem);
+
+        mx::GenContext context(shaderGenerator);
+        context.registerSourceCodeSearchPath(searchPath);
+        context.getOptions().targetColorSpaceOverride = "lin_rec709";
+
+        mx::DocumentPtr doc = mx::createDocument();
+        mx::readFromXmlString(doc, docString);
+        doc->setDataLibrary(libraries);
+        REQUIRE(doc->validate());
+
+        mx::ShaderPtr shader;
+        REQUIRE_NOTHROW(shader = shaderGenerator->generate("surface", doc->getNode("surface"), context));
+        REQUIRE(shader);
+
+        // Each compound instance gets a dedicated implementation variant.
+        const mx::ShaderNode* triplanarA = shader->getGraph().getNode("triplanar_a");
+        const mx::ShaderNode* triplanarB = shader->getGraph().getNode("triplanar_b");
+        REQUIRE(triplanarA);
+        REQUIRE(triplanarB);
+        CHECK(&triplanarA->getImplementation() != &triplanarB->getImplementation());
+
+        // Each variant transforms its textures with its own declared color space.
+        std::map<std::string, size_t> transformCountsA;
+        for (const mx::ShaderNode* node : triplanarA->getImplementation().getGraph()->getNodes())
+        {
+            if (mx::stringEndsWith(node->getName(), "_cm"))
+            {
+                transformCountsA[node->getImplementation().getName()]++;
+            }
+        }
+        CHECK(transformCountsA == std::map<std::string, size_t> { { "NG_srgb_texture_to_lin_rec709_color3", 3 } });
+        std::map<std::string, size_t> transformCountsB;
+        for (const mx::ShaderNode* node : triplanarB->getImplementation().getGraph()->getNodes())
+        {
+            if (mx::stringEndsWith(node->getName(), "_cm"))
+            {
+                transformCountsB[node->getImplementation().getName()]++;
+            }
+        }
+        CHECK(transformCountsB == std::map<std::string, size_t> { { "NG_acescg_to_lin_rec709_color3", 3 } });
+
+        // The plain image node keeps its color transform on its output.
+        size_t outputTransformCount = 0;
+        for (const mx::ShaderNode* node : shader->getGraph().getNodes())
+        {
+            if (mx::stringEndsWith(node->getName(), "_cm"))
+            {
+                ++outputTransformCount;
+                CHECK(node->getImplementation().getName() == "NG_srgb_texture_to_lin_rec709_color3");
+            }
+        }
+        CHECK(outputTransformCount == 1);
+    }
 }
 #endif
 

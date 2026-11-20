@@ -92,6 +92,15 @@ MX_GENSHADER_API NodePtr connectsToWorldSpaceNode(OutputPtr output);
 /// @param attributes Attributes to test for
 MX_GENSHADER_API bool hasElementAttributes(OutputPtr output, const StringVec& attributes);
 
+/// Resolve the color space that applies to a filename typed input, taking interface
+/// name connections to enclosing parent nodes into account. A parent node input that
+/// forwards to an outer interface without declaring its own color space defers to the
+/// outer declaration. Returns the empty string if no color space is active.
+/// @param input Filename input to resolve
+/// @param parentNodes Stack of enclosing parent nodes, innermost last
+/// @return The active color space for the input, or the empty string if none.
+MX_GENSHADER_API string getFileNameColorSpace(InputPtr input, const vector<ConstNodePtr>& parentNodes);
+
 //
 // These are deprecated wrappers for older versions of the function interfaces in this module.
 // Clients using these interfaces should update them to the latest API.

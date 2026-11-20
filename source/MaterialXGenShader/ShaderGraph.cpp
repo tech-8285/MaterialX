@@ -560,8 +560,12 @@ ShaderGraphPtr ShaderGraph::create(const ShaderGraph* parent, const string& name
         // Create output sockets
         graph->addOutputSockets(*nodeDef, context);
 
-        // Create this shader node in the graph.
+        // Create this shader node in the graph. Push the node as the current
+        // parent, so that a compound node implementation can resolve color
+        // space declarations on the node's filename inputs.
+        context.pushParentNode(node);
         ShaderNode* newNode = graph->createNode(node->getName(), node->getNamePath(), nodeDef, context);
+        context.popParentNode();
 
         // Share metadata.
         graph->setMetadata(newNode->getMetadata());
@@ -681,26 +685,23 @@ void ShaderGraph::applyInputTransforms(ConstNodePtr node, ShaderNode* shaderNode
             string sourceColorSpace = input->getActiveColorSpace();
             if (input->getType() == FILENAME_TYPE_STRING && (node->isColorType() || node->isMultiOutputType()))
             {
-                // Adjust the source color space for filename interface names.
+                // Adjust the source color space for filename interface names,
+                // taking color space declarations on parent nodes into account.
                 if (input->hasInterfaceName())
                 {
-                    for (ConstNodePtr parentNode : context.getParentNodes())
-                    {
-                        if (!parentNode->isColorType() && !parentNode->isMultiOutputType())
-                        {
-                            InputPtr interfaceInput = parentNode->getInput(input->getInterfaceName());
-                            string interfaceColorSpace = interfaceInput ? interfaceInput->getActiveColorSpace() : EMPTY_STRING;
-                            if (!interfaceColorSpace.empty())
-                            {
-                                sourceColorSpace = interfaceColorSpace;
-                            }
-                        }
-                    }
+                    sourceColorSpace = getFileNameColorSpace(input, context.getParentNodes());
                 }
 
+                // For compound nodes the color transform is applied per texture
+                // inside the node graph, before any blending or other operations,
+                // so no transform is needed on the node outputs.
+                const bool isCompoundNode = shaderNode->getImplementation().getGraph() != nullptr;
                 for (ShaderOutput* shaderOutput : shaderNode->getOutputs())
                 {
-                    populateColorTransformMap(colorManagementSystem, shaderOutput, sourceColorSpace, targetColorSpace, false);
+                    if (!isCompoundNode)
+                    {
+                        populateColorTransformMap(colorManagementSystem, shaderOutput, sourceColorSpace, targetColorSpace, false);
+                    }
                     populateUnitTransformMap(unitSystem, shaderOutput, input, targetDistanceUnit, false);
                 }
             }
@@ -1247,7 +1248,8 @@ void ShaderGraph::populateColorTransformMap(ColorManagementSystemPtr colorManage
                 {
                     const auto entry = std::make_pair(static_cast<ShaderOutput*>(shaderPort), transform);
                     // An output can carry only one transform, even when filename inputs use different color spaces.
-                    // Retain the first request until per-image transforms inside compound nodes are supported.
+                    // Retain the first request. Compound nodes are unaffected, since their color transforms
+                    // are applied per texture inside the node graph.
                     if (std::find_if(_outputColorTransformMap.begin(), _outputColorTransformMap.end(),
                                      [shaderPort](const auto& request) { return request.first == shaderPort; }) ==
                         _outputColorTransformMap.end())

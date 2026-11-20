@@ -616,6 +616,35 @@ bool hasElementAttributes(OutputPtr output, const StringVec& attributes)
     return false;
 }
 
+string getFileNameColorSpace(InputPtr input, const vector<ConstNodePtr>& parentNodes)
+{
+    string sourceColorSpace = input->getActiveColorSpace();
+    const string& interfaceName = input->getInterfaceName();
+    if (!interfaceName.empty())
+    {
+        for (ConstNodePtr parentNode : parentNodes)
+        {
+            InputPtr interfaceInput = parentNode ? parentNode->getInput(interfaceName) : nullptr;
+            if (!interfaceInput)
+            {
+                continue;
+            }
+            // An input that forwards to an outer interface without declaring its
+            // own color space defers to the outer declaration.
+            if (!interfaceInput->hasColorSpace() && interfaceInput->hasInterfaceName())
+            {
+                continue;
+            }
+            const string& interfaceColorSpace = interfaceInput->getActiveColorSpace();
+            if (!interfaceColorSpace.empty())
+            {
+                sourceColorSpace = interfaceColorSpace;
+            }
+        }
+    }
+    return sourceColorSpace;
+}
+
 void findRenderableMaterialNodes(ConstDocumentPtr doc, vector<TypedElementPtr>& elements, bool, std::unordered_set<ElementPtr>&)
 {
     elements = findRenderableMaterialNodes(doc);

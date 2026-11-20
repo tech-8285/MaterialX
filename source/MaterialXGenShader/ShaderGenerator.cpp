@@ -326,8 +326,18 @@ ShaderNodeImplPtr ShaderGenerator::getImplementation(const NodeDef& nodedef, Gen
 
     const string& name = implElement->getName();
 
+    // For node graph implementations, instances with different color space
+    // declarations on their filename inputs require dedicated implementations,
+    // since color space transforms are applied per texture inside the graph.
+    // Include a color space signature in the cache key to distinguish them.
+    string implName = name;
+    if (implElement->isA<NodeGraph>())
+    {
+        implName += CompoundNode::getColorSpaceSignature(nodedef, context);
+    }
+
     // Check if it's created and cached already.
-    ShaderNodeImplPtr impl = context.findNodeImplementation(name);
+    ShaderNodeImplPtr impl = context.findNodeImplementation(implName);
     if (impl)
     {
         return impl;
@@ -362,7 +372,7 @@ ShaderNodeImplPtr ShaderGenerator::getImplementation(const NodeDef& nodedef, Gen
     impl->initialize(*implElement, context);
 
     // Cache it.
-    context.addNodeImplementation(name, impl);
+    context.addNodeImplementation(implName, impl);
 
     return impl;
 }
